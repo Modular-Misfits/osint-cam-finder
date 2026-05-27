@@ -18,7 +18,7 @@ Each source produces a JSON file per run:
 
 ```bash
 pip install requests colorama
-python3 osint-cam-finder.py
+python3 webanator-json.py
 ```
 
 Choose source at the prompt, then select a country (Insecam) or proceed directly (FAA WeatherCams).
