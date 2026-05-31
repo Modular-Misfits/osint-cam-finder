@@ -1,7 +1,9 @@
 *.json
 __pycache__/
 *.pyc
+*.db
 .env
 .DS_Store
 CLAUDE.md
+UNIVERSAL_SWARM_RULES.md
 .claude/
