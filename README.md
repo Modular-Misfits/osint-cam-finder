@@ -2,6 +2,8 @@
 
 A desktop GUI application for discovering, cataloguing, and exporting publicly accessible cameras worldwide. Scans multiple data sources, stores results in a local SQLite database with delta detection, and exports to JSON.
 
+![OSINT Camera Finder — Scan tab](docs/screenshot.png)
+
 ## Features
 
 - **5 built-in data sources** — Insecam, FAA WeatherCams, OpenStreetMap, Windy Webcams, US DOT Traffic
