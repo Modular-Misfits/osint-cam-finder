@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.custom_sources import CustomSourceRegistry
+from app.core.enricher import EnrichRunner
 from app.core.scanner import ScanRunner
 from app.db.store import Store
 
@@ -128,10 +129,11 @@ class ScanPanel(QWidget):
     def __init__(self, scanner: ScanRunner, ui_queue: queue.Queue, store: Store,
                  custom_registry: CustomSourceRegistry):
         super().__init__()
-        self.scanner         = scanner
-        self.ui_queue        = ui_queue
-        self.store           = store
+        self.scanner          = scanner
+        self.ui_queue         = ui_queue
+        self.store            = store
         self._custom_registry = custom_registry
+        self._enricher        = EnrichRunner(store, ui_queue)
         self._build()
         self._sync_sources()
         custom_registry.register_change_callback(self._sync_sources)
@@ -179,8 +181,34 @@ class ScanPanel(QWidget):
         self.stop_btn.clicked.connect(self._stop)
         self.stop_btn.setEnabled(False)
 
+        ctrl_lay.addSpacing(16)
+
+        self.enrich_btn = QPushButton("Enrich Insecam")
+        self.enrich_btn.setMinimumWidth(130)
+        self.enrich_btn.setStyleSheet(_ACCENT_BTN)
+        self.enrich_btn.setToolTip(
+            "Fetch detail pages for all Insecam cameras missing lat/lon.\n"
+            "Runs with rate limiting (0.5s between requests)."
+        )
+        self.enrich_btn.clicked.connect(self._start_enrich)
+
+        self.enrich_stop_btn = QPushButton("Stop Enrich")
+        self.enrich_stop_btn.setMinimumWidth(100)
+        self.enrich_stop_btn.setStyleSheet(_ACCENT_BTN)
+        self.enrich_stop_btn.clicked.connect(self._stop_enrich)
+        self.enrich_stop_btn.setEnabled(False)
+
+        self.recat_btn = QPushButton("Re-categorize DB")
+        self.recat_btn.setMinimumWidth(140)
+        self.recat_btn.setStyleSheet(_ACCENT_BTN)
+        self.recat_btn.setToolTip("Re-run category inference on every camera in the DB using updated keywords.")
+        self.recat_btn.clicked.connect(self._recategorize)
+
         ctrl_lay.addWidget(self.start_btn)
         ctrl_lay.addWidget(self.stop_btn)
+        ctrl_lay.addWidget(self.enrich_btn)
+        ctrl_lay.addWidget(self.enrich_stop_btn)
+        ctrl_lay.addWidget(self.recat_btn)
 
         root.addWidget(ctrl_panel)
 
@@ -287,6 +315,35 @@ class ScanPanel(QWidget):
         self.scanner.stop()
         self._log("[!] Stop requested — finishing current camera...", COLOR_ERROR)
 
+    def _start_enrich(self):
+        if self._enricher.is_running() or self.scanner.is_running():
+            return
+        # Use the currently-selected country filter if source is Insecam, else enrich all
+        source = self.source_combo.currentText()
+        opt    = self.option_combo.currentText()
+        cc     = COUNTRY_MAP.get(opt, "") if source == "Insecam" and opt not in ("", "All") else ""
+        count  = len(self.store.insecam_unenriched_ids(cc))
+        if count == 0:
+            self._log("[*] No unenriched Insecam cameras found — nothing to do.", COLOR_DIM)
+            return
+        self._log(f"[*] Starting Insecam enrichment — {count} cameras to enrich...", COLOR_DIM)
+        self.start_btn.setEnabled(False)
+        self.enrich_btn.setEnabled(False)
+        self.enrich_stop_btn.setEnabled(True)
+        self.progress.setRange(0, 0)
+        self.progress.setFormat("Enriching...")
+        self._enricher.start(cc)
+
+    def _stop_enrich(self):
+        self._enricher.stop()
+        self._log("[!] Enrich stop requested...", COLOR_ERROR)
+
+    def _recategorize(self):
+        if self.scanner.is_running() or self._enricher.is_running():
+            return
+        updated = self.store.recategorize_all()
+        self._log(f"[+] Re-categorized {updated} cameras.", COLOR_NEW if updated else COLOR_DIM)
+
     def _log(self, text: str, color: str = COLOR_FG):
         self.log.moveCursor(QTextCursor.MoveOperation.End)
         self.log.setTextColor(QColor(color))
@@ -345,6 +402,9 @@ class ScanPanel(QWidget):
     def _reset_controls(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.enrich_btn.setEnabled(True)
+        self.enrich_stop_btn.setEnabled(False)
+        self.recat_btn.setEnabled(True)
         if self.progress.maximum() == 0:
             self.progress.setRange(0, 100)
             self.progress.setValue(0)

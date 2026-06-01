@@ -8,10 +8,12 @@ A desktop GUI application for discovering, cataloguing, and exporting publicly a
 
 - **5 built-in data sources** — Insecam, FAA WeatherCams, OpenStreetMap, Windy Webcams, US DOT Traffic
 - **Custom API sources** — add any JSON REST API via the Sources tab without touching code or restarting
-- **Persistent SQLite database** — delta detection (new / updated / unchanged) across runs; cameras missing URL and location data are silently discarded
+- **Persistent SQLite database** — delta detection (new / updated / unchanged) across runs; cameras without a URL are never stored
 - **Resumable scans** — Insecam skips already-harvested camera IDs so partial runs can continue
-- **Parallel scanning** — Insecam page collection and Windy pagination both use 10-thread parallel fetching; Insecam enrichment uses 40 threads
-- **Camera categorization** — weather, traffic, tourist, aviation, nature, security, unknown
+- **Parallel scanning** — Insecam page collection (15 threads) and Windy pagination (10 threads) both use parallel fetching; all metadata extracted from listing pages, no per-camera requests
+- **Insecam enrichment** — dedicated "Enrich Insecam" button rate-limits detail-page fetches (0.5s/req) to populate lat/lon, city, region, and manufacturer for unenriched cameras
+- **Camera categorization** — weather, traffic, tourist, aviation, nature, security, unknown; manufacturer names (Hikvision, Axis, Dahua, etc.) map to security; all Insecam cameras default to security
+- **Re-categorize DB** — one-click button re-runs category inference across all stored cameras after keyword updates
 - **Filterable database view** — filter by source, country, category, status, or free-text search; 200 rows per page
 - **JSON export** with the same filter options
 - **API key management** — Settings tab stores keys in a local `.env` file, never committed
@@ -36,7 +38,7 @@ python3 main.py
 
 | Source | Auth | Notes |
 |---|---|---|
-| Insecam | None | Scraped by country; parallel page fetch (10 threads) + enrichment (40 threads); resumable |
+| Insecam | None | Scraped by country; parallel page fetch (15 threads); all metadata from listing HTML; separate enrichment step (0.5s/req rate limit) for lat/lon; resumable |
 | FAA WeatherCams | None | ~3,400 US aviation weather cameras; requires `Referer`/`Origin` headers |
 | OpenStreetMap | None | Overpass API by country; 1,000 nodes per query; bbox sub-regions for large countries |
 | Windy Webcams | API key | 85,000+ webcams worldwide; parallel page fetch (10 threads); get a free key at windy.com/api/webcams |
@@ -85,7 +87,7 @@ The scanner runs in a daemon thread. All UI updates flow through a `queue.Queue`
 
 ### Delta detection
 
-`store.upsert_camera()` checks 9 fields (url, name, type, category, lat, lon, city, region, state) and returns `'new' | 'updated' | 'unchanged' | 'skipped'`. Records missing both a URL and any usable location data are skipped entirely and never written to the database. After each Insecam scan, `mark_offline()` marks previously-seen cameras that weren't returned in the current run.
+`store.upsert_camera()` checks 9 fields (url, name, type, category, lat, lon, city, region, state) and returns `'new' | 'updated' | 'unchanged' | 'skipped'`. Records missing a URL are skipped entirely and never written to the database. After each Insecam scan, `mark_offline()` marks previously-seen cameras that weren't returned in the current run.
 
 ### Overpass API notes
 

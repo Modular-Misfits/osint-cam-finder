@@ -3,6 +3,7 @@ import os
 import sqlite3
 from datetime import datetime, timezone
 from app.db.models import init_db
+from app.core.schema import infer_category
 
 _DEFAULT_DB = os.environ.get("OSINT_CAM_DB", "cameras.db")
 
@@ -66,12 +67,9 @@ class Store:
         """
         Insert or update a camera record.
         Returns delta status: 'new' | 'updated' | 'unchanged' | 'skipped'
-        Skips records that have no URL and no usable location (lat/lon or city/country).
+        Skips records with no URL — a URL is required for a camera to be useful.
         """
-        has_url = bool(cam.get("url"))
-        has_coords = cam.get("latitude") is not None and cam.get("longitude") is not None
-        has_place = bool(cam.get("city") or cam.get("state")) and bool(cam.get("country") or cam.get("country_code"))
-        if not has_url and not has_coords and not has_place:
+        if not cam.get("url"):
             return "skipped"
 
         extra = json.dumps(cam.get("extra") or {})
@@ -151,6 +149,44 @@ class Store:
         )
         self.conn.commit()
         return "updated" if changed else "unchanged"
+
+    def insecam_unenriched_ids(self, country_code: str = "") -> list[str]:
+        """Return Insecam camera_ids that are missing lat/lon (not yet enriched)."""
+        if country_code:
+            rows = self.conn.execute(
+                "SELECT camera_id FROM cameras WHERE source='Insecam' AND country_code=? "
+                "AND (latitude IS NULL OR longitude IS NULL) ORDER BY camera_id",
+                (country_code,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT camera_id FROM cameras WHERE source='Insecam' "
+                "AND (latitude IS NULL OR longitude IS NULL) ORDER BY camera_id",
+            ).fetchall()
+        return [r["camera_id"] for r in rows]
+
+    def enrich_camera(self, source: str, camera_id: str, fields: dict) -> None:
+        """Patch specific fields on an existing camera row. Only updates non-None values."""
+        allowed = {
+            "latitude", "longitude", "city", "region", "state",
+            "country", "country_code", "camera_type", "camera_name",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+        if not updates:
+            return
+        # Re-infer category when camera_type is updated; Insecam defaults to security
+        if "camera_type" in updates:
+            cam_name = updates.get("camera_name", "")
+            inferred = infer_category([updates["camera_type"], cam_name])
+            if inferred == "unknown" and source == "Insecam":
+                inferred = "security"
+            updates["category"] = inferred
+        set_clause = ", ".join(f"{k}=?" for k in updates)
+        self.conn.execute(
+            f"UPDATE cameras SET {set_clause}, last_seen=? WHERE source=? AND camera_id=?",
+            (*updates.values(), _now(), source, camera_id),
+        )
+        self.conn.commit()
 
     def mark_offline(self, source: str, country_code: str, seen_ids: set[str]):
         """Mark cameras not seen in the current scan as offline."""
@@ -232,6 +268,26 @@ class Store:
         with open(path, "w") as f:
             json.dump(rows, f, indent=2)
         return len(rows)
+
+    def recategorize_all(self) -> int:
+        """Re-run infer_category on every row and update category where it changed."""
+        rows = self.conn.execute(
+            "SELECT source, camera_id, camera_type, camera_name, category FROM cameras"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            new_cat = infer_category([row["camera_type"] or "", row["camera_name"] or ""])
+            if new_cat == "unknown" and row["source"] == "Insecam":
+                new_cat = "security"
+            if new_cat != row["category"]:
+                self.conn.execute(
+                    "UPDATE cameras SET category=? WHERE source=? AND camera_id=?",
+                    (new_cat, row["source"], row["camera_id"]),
+                )
+                updated += 1
+        if updated:
+            self.conn.commit()
+        return updated
 
     def sources(self) -> list[str]:
         rows = self.conn.execute("SELECT DISTINCT source FROM cameras ORDER BY source").fetchall()

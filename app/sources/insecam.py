@@ -7,11 +7,9 @@ import requests
 
 from app.core.schema import Camera, infer_category
 
-THREAD_POOL_SIZE   = 40   # Phase 2 enrichment — network-latency bound, benefits from more threads
-PAGE_POOL_SIZE     = 10   # Phase 1 page scraping
-CONNECT_TIMEOUT    = 4
-READ_TIMEOUT       = 5
-FUTURE_DEADLINE    = CONNECT_TIMEOUT + READ_TIMEOUT + 3
+PAGE_POOL_SIZE  = 15   # parallel listing page fetches
+CONNECT_TIMEOUT = 4
+READ_TIMEOUT    = 8
 
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 12; SAMSUNG SM-A125F) "
@@ -30,98 +28,67 @@ def _get_thread_session() -> requests.Session:
     return thread_local.session
 
 
-def _fetch_detail(cam_id: str) -> dict:
-    url = f"http://www.insecam.org/en/view/{cam_id}/"
-    try:
-        resp = _get_thread_session().get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        html = resp.text
-
-        title_m = re.search(r'<title>\s*View\s+(.*?)\s+camera\s+in\s+(.*?)\s*</title>', html, re.IGNORECASE)
-        cam_type = title_m.group(1).strip() if title_m else ""
-        location_raw = title_m.group(2).strip() if title_m else ""
-
-        coords = re.findall(r'(?:setView|marker|LatLng)\s*\(\s*\[?\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)', html, re.IGNORECASE)
-        latitude = float(coords[0][0]) if coords else None
-        longitude = float(coords[0][1]) if coords else None
-
-        city = region = ""
-        desc_m = re.search(r'Watch live cam located in ([^\r\n<]+)', html, re.IGNORECASE)
-        if desc_m:
-            raw = desc_m.group(1).strip()
-            region_m = re.search(r'region\s+(\S+)\s+(.*)', raw)
-            if region_m:
-                region = region_m.group(1).strip()
-                city = region_m.group(2).strip()
-        elif location_raw:
-            parts = [p.strip() for p in location_raw.split(",")]
-            if len(parts) >= 2:
-                city = parts[-1]
-
-        return {
-            "camera_type": cam_type,
-            "latitude": latitude,
-            "longitude": longitude,
-            "city": city,
-            "region": region,
-            "location_raw": location_raw,
-        }
-    except Exception:
-        return {}
-
-
-def _enrich(cam_id: str, cam_url: str, country_code: str, country_name: str) -> Camera:
-    try:
-        resp = _get_thread_session().get(cam_url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        status = resp.status_code
-        server = resp.headers.get("Server", "")
-    except Exception:
-        status, server = None, ""
-
-    detail = _fetch_detail(cam_id)
-    cam_type = detail.get("camera_type", "")
-
-    return Camera(
-        source="Insecam",
-        camera_id=cam_id,
-        url=cam_url,
-        camera_name=cam_type or cam_id,
-        camera_type=cam_type,
-        category=infer_category([cam_type, server or ""]),
-        latitude=detail.get("latitude"),
-        longitude=detail.get("longitude"),
-        country=country_name,
-        country_code=country_code,
-        state="",
-        city=detail.get("city", ""),
-        region=detail.get("region", ""),
-        extra={
-            "http_status": status,
-            "server": server,
-            "location_raw": detail.get("location_raw", ""),
-        },
-    )
-
-
 def _fetch_page(country_code: str, page: int) -> tuple[int, str]:
-    """Fetch one listing page; returns (page_number, html)."""
     url = f"http://www.insecam.org/en/bycountry/{country_code}/?page={page}"
     resp = _get_thread_session().get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
     resp.raise_for_status()
     return page, resp.text
 
 
-def _parse_pairs(html: str, skip_ids: set[str], existing: dict[str, str]) -> dict[str, str]:
-    """Extract (cam_id → stream_url) pairs from one listing page HTML."""
-    pairs: dict[str, str] = {}
-    for m in re.finditer(r'/en/view/(\d+)/', html):
-        cid = m.group(1)
-        if cid in existing or cid in skip_ids:
+# Each camera thumbnail block on the listing page looks like:
+#   <div class="thumbnail-item__wrap">
+#     ...src="http://IP:PORT/path"...
+#     /en/view/CAMID/
+#     ...timezone, city, country strings...
+# We extract all fields we can directly from listing HTML — no per-camera detail requests.
+_CITY_RE = re.compile(r'class="thumbnail-item__city[^"]*"[^>]*>\s*([^<]+)<', re.IGNORECASE)
+_TYPE_RE = re.compile(r'class="thumbnail-item__type[^"]*"[^>]*>\s*([^<]+)<', re.IGNORECASE)
+
+
+def _parse_cameras(
+    html: str,
+    country_code: str,
+    country_name: str,
+    skip_ids: set[str],
+    seen_ids: set[str],
+) -> list[Camera]:
+    cameras = []
+    # Split on thumbnail wrapper boundaries so regex doesn't bleed across blocks
+    blocks = re.split(r'class="thumbnail-item__wrap"', html)
+    for block in blocks[1:]:  # first split is before any block
+        url_m = re.search(r'src="(http://\d+\.\d+\.\d+\.\d+:\d+[^"]*)"', block)
+        id_m  = re.search(r'/en/view/(\d+)/', block)
+        if not url_m or not id_m:
             continue
-        tail = html[m.start(): m.start() + 600]
-        url_m = re.search(r'src="(http://\d+\.\d+\.\d+\.\d+:\d+[^"]*)"', tail)
-        if url_m:
-            pairs[cid] = url_m.group(1)
-    return pairs
+        cam_id   = id_m.group(1)
+        cam_url  = url_m.group(1)
+        if cam_id in skip_ids or cam_id in seen_ids:
+            continue
+        seen_ids.add(cam_id)
+
+        city_m = _CITY_RE.search(block)
+        type_m = _TYPE_RE.search(block)
+        city     = city_m.group(1).strip() if city_m else ""
+        cam_type = type_m.group(1).strip() if type_m else ""
+
+        inferred = infer_category([cam_type])
+        cameras.append(Camera(
+            source="Insecam",
+            camera_id=cam_id,
+            url=cam_url,
+            camera_name=cam_type or cam_id,
+            camera_type=cam_type,
+            category=inferred if inferred != "unknown" else "security",
+            latitude=None,
+            longitude=None,
+            country=country_name,
+            country_code=country_code,
+            state="",
+            city=city,
+            region="",
+            extra={},
+        ))
+    return cameras
 
 
 def run(
@@ -133,79 +100,61 @@ def run(
 ) -> Iterator[tuple[Camera, str]]:
     """
     Yields (camera, log_message) tuples.
+    All metadata is extracted from listing pages only — no per-camera HTTP requests.
     skip_ids: camera IDs already in DB — enables resume.
     stop_event: set to request graceful cancellation.
     """
-    skip_ids = skip_ids or set()
+    skip_ids  = skip_ids or set()
     stop_event = stop_event or threading.Event()
+    seen_ids: set[str] = set()
 
-    all_pairs: dict[str, str] = {}
-
-    # Phase 1: discover total page count from page 1, then fetch remaining pages in parallel
     try:
         _, first_html = _fetch_page(country_code, 1)
-        if not re.search(r'/en/view/\d+/', first_html):
-            yield None, f"[!] No cameras found for {country_code}"  # type: ignore[misc]
-            return
-
-        all_pairs.update(_parse_pairs(first_html, skip_ids, all_pairs))
-
-        # Discover last page number from pagination links
-        page_nums = [int(n) for n in re.findall(r'\?page=(\d+)', first_html)]
-        last_page = max(page_nums) if page_nums else 1
-
-        if last_page > 1 and not stop_event.is_set():
-            yield None, f"[*] {country_code}: {last_page} pages to fetch — parallel..."  # type: ignore[misc]
-            with ThreadPoolExecutor(max_workers=PAGE_POOL_SIZE) as ex:
-                futures = {
-                    ex.submit(_fetch_page, country_code, p): p
-                    for p in range(2, last_page + 1)
-                }
-                for fut in as_completed(futures):
-                    if stop_event.is_set():
-                        ex.shutdown(wait=False, cancel_futures=True)
-                        break
-                    try:
-                        _, html = fut.result(timeout=FUTURE_DEADLINE)
-                        all_pairs.update(_parse_pairs(html, skip_ids, all_pairs))
-                    except Exception:
-                        pass
     except Exception as e:
-        yield None, f"[!] Page collection error: {e}"  # type: ignore[misc]
-
-    total = len(all_pairs)
-    yield None, f"[+] Found {total} new cameras to enrich (skipped {len(skip_ids)} already in DB)"  # type: ignore[misc]
-
-    if not all_pairs or stop_event.is_set():
+        yield None, f"[!] Failed to fetch first page: {e}"  # type: ignore[misc]
         return
 
-    # Phase 2: parallel enrichment
-    done = 0
-    with ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE) as executor:
-        futures = {
-            executor.submit(_enrich, cid, curl, country_code, country_name): cid
-            for cid, curl in all_pairs.items()
-        }
-        for future in as_completed(futures):
+    if not re.search(r'/en/view/\d+/', first_html):
+        yield None, f"[!] No cameras found for {country_code}"  # type: ignore[misc]
+        return
+
+    # Pagination is driven by JS: pagenavigator("?page=", TOTAL_PAGES, CURRENT)
+    # The only ?page= link in the HTML is the next-page arrow, so we must parse
+    # the pagenavigator call to get the real total page count.
+    pagnav_m  = re.search(r'pagenavigator\(\s*"[^"]*"\s*,\s*(\d+)', first_html)
+    last_page = int(pagnav_m.group(1)) if pagnav_m else 1
+    yield None, f"[*] {country_code}: {last_page} page(s) — fetching in parallel..."  # type: ignore[misc]
+
+    # Collect all pages in parallel (first page already fetched)
+    all_html: list[str] = [first_html]
+    if last_page > 1 and not stop_event.is_set():
+        with ThreadPoolExecutor(max_workers=PAGE_POOL_SIZE) as ex:
+            futures = {
+                ex.submit(_fetch_page, country_code, p): p
+                for p in range(2, last_page + 1)
+            }
+            for fut in as_completed(futures):
+                if stop_event.is_set():
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    _, html = fut.result(timeout=30)
+                    all_html.append(html)
+                except Exception:
+                    pass
+
+    # Parse all pages and yield cameras immediately — no further HTTP requests
+    total = 0
+    for html in all_html:
+        if stop_event.is_set():
+            break
+        cameras = _parse_cameras(html, country_code, country_name, skip_ids, seen_ids)
+        for cam in cameras:
             if stop_event.is_set():
-                executor.shutdown(wait=False, cancel_futures=True)
                 break
-            cid = futures[future]
-            try:
-                cam = future.result(timeout=FUTURE_DEADLINE)
-                city_display = cam["city"] or cam["extra"].get("location_raw", "")
-                lat = cam["latitude"] or ""
-                lon = cam["longitude"] or ""
-                msg = (
-                    f"[+] {cam['url']}  [{cam['extra'].get('server', '')}]"
-                    f"  [{cam['extra'].get('http_status', '')}]"
-                    f"  | {city_display} | {lat}, {lon}"
-                )
-                yield cam, msg
-            except TimeoutError:
-                yield None, f"[!] Camera {cid} timed out — skipping"  # type: ignore[misc]
-            except Exception:
-                pass
-            done += 1
-            if done % 50 == 0:
-                yield None, f"[...] {done}/{total} cameras processed"  # type: ignore[misc]
+            total += 1
+            yield cam, f"[+] {cam['url']} | {cam['city']} | {cam['camera_type']}"  # type: ignore[misc]
+        if total and total % 100 == 0:
+            yield None, f"[...] {total} cameras found so far"  # type: ignore[misc]
+
+    yield None, f"[+] Insecam {country_code} complete — {total} cameras (skipped {len(skip_ids)} already in DB)"  # type: ignore[misc]
